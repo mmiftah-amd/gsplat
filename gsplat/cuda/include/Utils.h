@@ -48,4 +48,14 @@ inline std::tuple<size_t, size_t> chunk(size_t size, c10::DeviceIndex device)
 }
 
 void merge_streams();
+
+#if defined(USE_ROCM)
+// Lanes of a wavefront on the current device: 32 or 64.
+inline int device_warp_size()
+{
+    int lanes = 0;
+    return hipDeviceGetAttribute(&lanes, hipDeviceAttributeWarpSize, c10::cuda::current_device()) == hipSuccess ? lanes
+                                                                                                                : 0;
+}
+#endif
 } // namespace gsplat

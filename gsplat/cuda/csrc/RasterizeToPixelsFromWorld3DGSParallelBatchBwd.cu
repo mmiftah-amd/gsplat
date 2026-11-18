@@ -590,14 +590,14 @@ __global__ void rasterize_gradient_bwd_kernel(
     vec4 *quat_batch        = reinterpret_cast<vec4 *>(&scale_batch[block_size]);
     float *rgbs_batch       = (float *)&quat_batch[block_size];
 #    if USE_ROCM
-    using warp_reduce_float_t = rocprim::warp_reduce<float, 64>;
+    using warp_reduce_float_t = rocprim::warp_reduce<float, GSPLAT_WARP_SIZE>;
     auto *warp_storage_base   = (typename warp_reduce_float_t::storage_type *)(
         rgbs_batch + block_size * cdim_smem_stride<CDIM>()
     );
 #    endif
 
 #    if USE_ROCM
-    cg::thread_block_tile<64> warp = cg::tiled_partition<64>(block);
+    cg::thread_block_tile<GSPLAT_WARP_SIZE> warp = cg::tiled_partition<GSPLAT_WARP_SIZE>(block);
 #    else
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 #    endif
@@ -924,11 +924,11 @@ __global__ void rasterize_gradient_bwd_kernel(
                 }
             }
 #    if USE_ROCM
-            rocprim_warpSum<CDIM, 64>(v_rgb_local, warp_storage_base);
-            rocprim_warpSum<64>(v_mean_local, warp_storage_base);
-            rocprim_warpSum<64>(v_scale_local, warp_storage_base);
-            rocprim_warpSum<64>(v_quat_local, warp_storage_base);
-            rocprim_warpSum<64>(v_opacity_local, warp_storage_base);
+            rocprim_warpSum<CDIM, GSPLAT_WARP_SIZE>(v_rgb_local, warp_storage_base);
+            rocprim_warpSum<GSPLAT_WARP_SIZE>(v_mean_local, warp_storage_base);
+            rocprim_warpSum<GSPLAT_WARP_SIZE>(v_scale_local, warp_storage_base);
+            rocprim_warpSum<GSPLAT_WARP_SIZE>(v_quat_local, warp_storage_base);
+            rocprim_warpSum<GSPLAT_WARP_SIZE>(v_opacity_local, warp_storage_base);
 #    else
             warpSum<CDIM>(v_rgb_local, warp);
             warpSum(v_mean_local, warp);
@@ -1165,9 +1165,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
         constexpr bool UseHitDistance = static_cast<bool>(UseHitDistanceT::value);
 #    if USE_ROCM
         const uint32_t block_size = tile_size * tile_size;
-        const uint32_t warps_per_block = (block_size + 63) / 64;
+        const uint32_t warps_per_block = (block_size + 31) / 32;
         std::size_t warp_scratch_bytes
-            = warps_per_block * sizeof(typename rocprim::warp_reduce<float, 64>::storage_type);
+            = warps_per_block * sizeof(typename rocprim::warp_reduce<float, GSPLAT_WARP_SIZE>::storage_type);
         int64_t shmem_size = tile_size
                            * tile_size
                            * (sizeof(int32_t)

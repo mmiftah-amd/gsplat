@@ -36,6 +36,8 @@
 #        include <hip/hip_cooperative_groups.h>
 #        include <rocprim/warp/warp_reduce.hpp>
 #        include <rocprim/functional.hpp>
+// Lanes of a wavefront on the device being compiled for: 32 or 64.
+#        define GSPLAT_WARP_SIZE (::rocprim::arch::wavefront::min_size())
 #    endif
 #endif
 #include <cuda/std/limits>

@@ -50,16 +50,31 @@ namespace cg = cooperative_groups;
 //   * the CDIM-wide v_colors reduction leaves element e in lane e % 64, so the
 //     final atomics are wave-coalesced instead of serialized on one lane.
 // ---------------------------------------------------------------------------
+// 32-lane targets have no DPP broadcast and never launch the kernel that uses it.
 template<int CTRL>
 __device__ __forceinline__ float dpp_mov(float v)
 {
-    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), CTRL, 0xf, 0xf, true));
+    if constexpr(GSPLAT_WARP_SIZE != 64)
+    {
+        return v;
+    }
+    else
+    {
+        return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), CTRL, 0xF, 0xF, true));
+    }
 }
 
 template<int CTRL>
 __device__ __forceinline__ int32_t dpp_mov(int32_t v)
 {
-    return __builtin_amdgcn_mov_dpp(v, CTRL, 0xf, 0xf, true);
+    if constexpr(GSPLAT_WARP_SIZE != 64)
+    {
+        return v;
+    }
+    else
+    {
+        return __builtin_amdgcn_mov_dpp(v, CTRL, 0xF, 0xF, true);
+    }
 }
 
 // DPP controls: ROW_SHR(n) = 0x110 + n, ROW_BCAST15 = 0x142, ROW_BCAST31 = 0x143.
@@ -420,7 +435,7 @@ __launch_bounds__(64) __global__ void rasterize_bs64_to_pixels_3dgs_bwd_kernel(
 template<uint32_t CDIM>
 inline bool rocm_use_bs64_bwd(const uint32_t tile_size, uint32_t &max_batch_size, int64_t &shmem_size)
 {
-    if(tile_size * tile_size != 64)
+    if(tile_size * tile_size != 64 || device_warp_size() != 64)
     {
         return false;
     }
@@ -530,7 +545,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     vec3 *conic_batch      = reinterpret_cast<vec3 *>(&xy_opacity_batch[block_size]); // [block_size]
     float *rgbs_batch      = (float *)&conic_batch[block_size];                       // [block_size * CDIM]
 #    if USE_ROCM
-    using warp_reduce_float_t = rocprim::warp_reduce<float, 64>;
+    using warp_reduce_float_t = rocprim::warp_reduce<float, GSPLAT_WARP_SIZE>;
     auto *warp_storage_base   = (typename warp_reduce_float_t::storage_type *)(rgbs_batch + block_size * CDIM);
 #    endif
 
@@ -555,7 +570,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
     // each thread loads one gaussian at a time before rasterizing
     const uint32_t tr = block.thread_rank();
 #    if USE_ROCM
-    cg::thread_block_tile<64> warp = cg::tiled_partition<64>(block);
+    cg::thread_block_tile<GSPLAT_WARP_SIZE> warp = cg::tiled_partition<GSPLAT_WARP_SIZE>(block);
 #    else
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 #    endif
@@ -693,14 +708,14 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
                 }
             }
 #    if USE_ROCM
-            rocprim_warpSum<CDIM, 64>(v_rgb_local, warp_storage_base);
-            rocprim_warpSum<64>(v_conic_local, warp_storage_base);
-            rocprim_warpSum<64>(v_xy_local, warp_storage_base);
+            rocprim_warpSum<CDIM, GSPLAT_WARP_SIZE>(v_rgb_local, warp_storage_base);
+            rocprim_warpSum<GSPLAT_WARP_SIZE>(v_conic_local, warp_storage_base);
+            rocprim_warpSum<GSPLAT_WARP_SIZE>(v_xy_local, warp_storage_base);
             if(v_means2d_abs != nullptr)
             {
-                rocprim_warpSum<64>(v_xy_abs_local, warp_storage_base);
+                rocprim_warpSum<GSPLAT_WARP_SIZE>(v_xy_abs_local, warp_storage_base);
             }
-            rocprim_warpSum<64>(v_opacity_local, warp_storage_base);
+            rocprim_warpSum<GSPLAT_WARP_SIZE>(v_opacity_local, warp_storage_base);
 #    else
             warpSum<CDIM>(v_rgb_local, warp);
             warpSum(v_conic_local, warp);
@@ -833,9 +848,9 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
 
 #    if USE_ROCM
         const uint32_t block_size = tile_size * tile_size;
-        const uint32_t warps_per_block = (block_size + 63) / 64;
+        const uint32_t warps_per_block = (block_size + 31) / 32;
         std::size_t warp_scratch_bytes
-            = warps_per_block * sizeof(typename rocprim::warp_reduce<float, 64>::storage_type);
+            = warps_per_block * sizeof(typename rocprim::warp_reduce<float, GSPLAT_WARP_SIZE>::storage_type);
         int64_t shmem_size = tile_size
                            * tile_size
                            * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM)
@@ -1023,9 +1038,9 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernels(
 
 #    if USE_ROCM
         const uint32_t block_size = tile_size * tile_size;
-        const uint32_t warps_per_block = (block_size + 63) / 64;
+        const uint32_t warps_per_block = (block_size + 31) / 32;
         std::size_t warp_scratch_bytes
-            = warps_per_block * sizeof(typename rocprim::warp_reduce<float, 64>::storage_type);
+            = warps_per_block * sizeof(typename rocprim::warp_reduce<float, GSPLAT_WARP_SIZE>::storage_type);
         int64_t shmem_size = tile_size
                            * tile_size
                            * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM)

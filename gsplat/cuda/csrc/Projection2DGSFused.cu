@@ -455,7 +455,7 @@ __global__ void projection_2dgs_fused_bwd_kernel(
     auto warp = cg::tiled_partition<32>(cg::this_thread_block());
 
     // Get warp context for dynamic reductions
-    unsigned int warp_thread_id = threadIdx.x % 64;
+    unsigned int warp_thread_id = threadIdx.x % warpSize;
     unsigned long long warp_active_mask = __activemask();
 
     #if USE_ROCM

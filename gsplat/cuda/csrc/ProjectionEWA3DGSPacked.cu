@@ -579,7 +579,7 @@ __global__ void projection_ewa_3dgs_packed_bwd_kernel(
 
     auto warp = cg::tiled_partition<32>(cg::this_thread_block());
 
-    unsigned int warp_thread_id = threadIdx.x % 64;
+    unsigned int warp_thread_id = threadIdx.x % warpSize;
     unsigned long long warp_active_mask = __activemask();
 
     if(sparse_grad)
