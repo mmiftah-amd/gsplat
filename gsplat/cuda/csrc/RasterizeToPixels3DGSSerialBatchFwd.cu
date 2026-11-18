@@ -65,7 +65,15 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     constexpr uint32_t BATCH_SIZE = CTA_SIZE;
     constexpr uint32_t PIXELS_PER_THREAD
         = TILE_SIZE * TILE_SIZE / CTA_SIZE; // (TILE, CTA) = (16,64)->4, (8,32)->2, (4,16)->1
+#    if USE_ROCM
+    // 128 threads on a 16x16 tile: each 32-lane wavefront owns an 8x8 pixel block, two
+    // pixels per lane four rows apart, and skips the gaussians that do not reach its block.
+    constexpr bool WAVE_BLOCKS    = TILE_SIZE == 16 && CTA_SIZE == 128;
+    constexpr uint32_t ROW_STRIDE = WAVE_BLOCKS ? 4 : CTA_SIZE / TILE_SIZE;
+    __shared__ float color_batch[WAVE_BLOCKS ? CTA_SIZE * CDIM : 1]; // the batch's colors
+#    else
     constexpr uint32_t ROW_STRIDE = CTA_SIZE / TILE_SIZE;
+#    endif
     constexpr uint32_t TILE_MASK  = TILE_SIZE - 1;
     constexpr uint32_t TILE_SHIFT = __builtin_ctz(TILE_SIZE);
     constexpr uint32_t ALL_DONE   = (1u << PIXELS_PER_THREAD) - 1u;
@@ -86,8 +94,13 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     const int32_t tile_id = tile_y * grid_width + tile_x;
 
     const uint32_t tid      = threadIdx.x;
+#    if USE_ROCM
+    const uint32_t thread_x = WAVE_BLOCKS ? (tid / 32 % 2) * 8 + tid % 8 : tid & TILE_MASK;
+    const uint32_t thread_y = WAVE_BLOCKS ? (tid / 64) * 8 + tid % 32 / 8 : tid >> TILE_SHIFT;
+#    else
     const uint32_t thread_x = tid & TILE_MASK;   // X & 0xF(15) == X % 16
     const uint32_t thread_y = tid >> TILE_SHIFT; // X >> 4 == X / 16
+#    endif
 
     isect_offsets += image_id * grid_height * grid_width;
     render_colors += image_id * image_height * image_width * CDIM;
@@ -206,6 +219,16 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
             const float opac      = opacities[g];
             xy_opacity_batch[tid] = {xy.x, xy.y, opac};
             conic_batch[tid]      = conics[g];
+#    if USE_ROCM
+            if constexpr(WAVE_BLOCKS)
+            {
+#        pragma unroll
+                for(uint32_t k = 0; k < CDIM; ++k)
+                {
+                    color_batch[tid * CDIM + k] = colors[g * CDIM + k];
+                }
+            }
+#    endif
         }
 
         // wait for other threads to collect the gaussians in batch. A CTA
@@ -222,8 +245,41 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
         // process gaussians in the current batch
         const int64_t remaining   = range_end - batch_start;
         const uint32_t batch_size = static_cast<uint32_t>(remaining < BATCH_SIZE ? remaining : BATCH_SIZE);
+#    if USE_ROCM
+        // bit l of reaches[i]: gaussian 32 * i + l of the batch reaches the wavefront's block
+        uint32_t reaches[CTA_SIZE / 32 + 1] = {0};
+        if constexpr(WAVE_BLOCKS)
+        {
+            const float x0 = (float)(out_x - tid % 8) + 0.5f;
+            const float y0 = (float)(out_y[0] - tid % 32 / 8) + 0.5f;
+#        pragma unroll
+            for(uint32_t i = 0; i < CTA_SIZE / 32; ++i)
+            {
+                const uint32_t j = i * 32 + tid % 32;
+                reaches[i]       = __builtin_amdgcn_readfirstlane((uint32_t)__ballot(
+                    j < batch_size
+                    && gaussian_reaches_rect(conic_batch[j], xy_opacity_batch[j], x0, y0, x0 + 7.f, y0 + 7.f)
+                ));
+            }
+        }
+#    endif
         for(uint32_t t = 0; (t < batch_size) && (done_mask != ALL_DONE); ++t)
         {
+#    if USE_ROCM
+            if constexpr(WAVE_BLOCKS)
+            {
+                // on to the next gaussian that reaches the block
+                while(t < batch_size && !(reaches[t / 32] >> t % 32))
+                {
+                    t = (t / 32 + 1) * 32;
+                }
+                if(t >= batch_size)
+                {
+                    break;
+                }
+                t += __builtin_ctz(reaches[t / 32] >> t % 32);
+            }
+#    endif
             const vec3 conic   = conic_batch[t];
             const vec3 xy_opac = xy_opacity_batch[t];
             const float opac   = xy_opac.z;
@@ -254,7 +310,11 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
 
                 const int32_t g    = id_batch[t];
                 const float vis    = alpha * T[p];
+#    if USE_ROCM
+                const float *c_ptr = WAVE_BLOCKS ? color_batch + t * CDIM : colors + g * CDIM;
+#    else
                 const float *c_ptr = colors + g * CDIM;
+#    endif
 #    pragma unroll
                 for(uint32_t k = 0; k < CDIM; ++k)
                 {
@@ -417,6 +477,15 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         // register footprint scales with 4*CDIM and spills to local memory at high
         // channel counts (~10x slower forward at CDIM=128). PPT=1 makes register
         // pressure scale with CDIM alone; it is parity at CDIM=3 (see issue #8).
+#    if USE_ROCM
+        // an 8x8 pixel block per 32-lane wavefront, while two pixels per lane fit the registers
+        constexpr uint32_t WAVE_BLOCKS_CTA = CDIM <= 32 ? 128 : 256;
+        if(tile_size == 16 && WAVE_BLOCKS_CTA == 128 && device_warp_size() == 32)
+        {
+            launch_variant.template operator()<16, WAVE_BLOCKS_CTA>();
+            return;
+        }
+#    endif
         if(tile_size == 16)
         {
             launch_variant.template operator()<16, 256>();

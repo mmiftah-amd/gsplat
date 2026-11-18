@@ -449,6 +449,391 @@ inline bool rocm_use_bs64_bwd(const uint32_t tile_size, uint32_t &max_batch_size
     shmem_size     = bytes;
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// 32-lane GPUs: backward for 16x16 tiles without atomics, which serialize on
+// the gaussians that cover many tiles. As in the forward, a wavefront owns an
+// 8x8 pixel block, two pixels per lane, and walks only the gaussians that reach
+// it. Thread t adds up gaussian t's sums over the tile and stores them at the
+// intersection's index before the sort, which intersect_tile leaves behind
+// flatten_ids. There the intersections of a gaussian are contiguous, and
+// gather_isect_grads_kernel adds them.
+// ---------------------------------------------------------------------------
+
+// Reduces across the wavefront; every lane receives the result.
+template<typename T, typename Op>
+__device__ __forceinline__ T wave_all_reduce(T val, Op op)
+{
+    using reduce_t = rocprim::warp_reduce<T, GSPLAT_WARP_SIZE, /*UseAllReduce=*/true>;
+    typename reduce_t::storage_type unused;
+    T result;
+    reduce_t().reduce(val, result, unused, op);
+    return result;
+}
+
+// Sums eight values over a 32-lane wavefront at once: lane k < 8 returns the total of
+// v[k], with seven DPP exchanges and two lane permutes instead of eight reductions.
+__device__ __forceinline__ float wave32_sum8(float v[8], const uint32_t lane)
+{
+#        define GSPLAT_DPP(x, ctrl) __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), ctrl, 0xF, 0xF, false))
+    for(int k = 0; k < 4; ++k)
+    {
+        v[k] = ((lane & 4) ? v[k + 4] : v[k]) + GSPLAT_DPP((lane & 4) ? v[k] : v[k + 4], 0x141);
+    }
+    for(int k = 0; k < 2; ++k)
+    {
+        v[k] = ((lane & 2) ? v[k + 2] : v[k]) + GSPLAT_DPP((lane & 2) ? v[k] : v[k + 2], 0x1B);
+    }
+    v[0] = ((lane & 1) ? v[1] : v[0]) + GSPLAT_DPP((lane & 1) ? v[0] : v[1], 0xB1);
+#        undef GSPLAT_DPP
+    // add the other half of the row of 16 lanes, then the other row
+    if constexpr(ROCPRIM_HAS_PERMLANE())
+    {
+        const int bits = __float_as_int(v[0]);
+        const float half
+            = v[0] + __int_as_float(__builtin_amdgcn_permlane16(bits, bits, 0xFEDCBA98, 0x76543210, false, false));
+        const int half_bits = __float_as_int(half);
+        return half
+             + __int_as_float(__builtin_amdgcn_permlanex16(half_bits, half_bits, 0x76543210, 0xFEDCBA98, false, false));
+    }
+    else
+    {
+        const float half = v[0] + __shfl_xor(v[0], 8, 32);
+        return half + __shfl_xor(half, 16, 32);
+    }
+}
+
+bool rasterize_blocks_to_pixels_3dgs_bwd_fits(
+    const at::Tensor &means2d, const at::Tensor &colors, const uint32_t tile_size, const at::Tensor &flatten_ids
+)
+{
+    const int64_t n_isects = flatten_ids.numel(), n_gauss = means2d.numel() / 2;
+    return n_isects > 0
+        && tile_size == 16
+        && colors.size(-1) <= 32
+        && device_warp_size() == 32
+        && flatten_ids.storage_offset() == 0
+        && flatten_ids.storage().nbytes() == 2 * (n_isects + n_gauss) * sizeof(int32_t);
+}
+
+template<uint32_t CDIM, bool ABS>
+__global__ void __launch_bounds__(128) rasterize_blocks_to_pixels_3dgs_bwd_kernel(
+    const uint32_t I,
+    const int64_t n_isects,
+    // fwd inputs
+    const vec2 *__restrict__ means2d,      // [..., N, 2] or [nnz, 2]
+    const vec3 *__restrict__ conics,       // [..., N, 3] or [nnz, 3]
+    const float *__restrict__ colors,      // [..., N, CDIM] or [nnz, CDIM]
+    const float *__restrict__ opacities,   // [..., N] or [nnz]
+    const float *__restrict__ backgrounds, // [..., CDIM]
+    const bool *__restrict__ masks,        // [..., tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    const int64_t *__restrict__ tile_offsets, // [..., tile_height, tile_width]
+    const int32_t *__restrict__ flatten_ids,  // [n_isects], then each one's index before the sort
+    // fwd outputs
+    const float *__restrict__ render_alphas, // [..., image_height, image_width, 1]
+    const int32_t *__restrict__ last_ids,    // [..., image_height, image_width]
+    // grad outputs
+    const float *__restrict__ v_render_colors, // [..., image_height, image_width, CDIM]
+    const float *__restrict__ v_render_alphas, // [..., image_height, image_width, 1]
+    // sums per intersection: colors, conic, mean, opacity, absolute mean
+    float *__restrict__ part // [n_isects, GRADS]
+)
+{
+    constexpr uint32_t WAVE = 32, WAVES = 4, PIXELS = 2, GRADS = CDIM + (ABS ? 8 : 6);
+    const uint32_t tr = threadIdx.x, wave = tr / WAVE, lane = tr % WAVE;
+    const uint32_t n_tiles  = tile_width * tile_height;
+    const uint32_t image_id = blockIdx.x / n_tiles, tile_id = blockIdx.x % n_tiles;
+    // the first pixel of the wavefront's block
+    const uint32_t bx = tile_id % tile_width * 16 + (wave & 1) * 8, by = tile_id / tile_width * 16 + (wave >> 1) * 8;
+
+    tile_offsets    += image_id * n_tiles;
+    render_alphas   += image_id * image_height * image_width;
+    last_ids        += image_id * image_height * image_width;
+    v_render_colors += image_id * image_height * image_width * CDIM;
+    v_render_alphas += image_id * image_height * image_width;
+    if(backgrounds != nullptr)
+    {
+        backgrounds += image_id * CDIM;
+    }
+
+    const int64_t range_start = tile_offsets[tile_id];
+    const int64_t range_end   = (image_id == I - 1) && (tile_id == n_tiles - 1) ? n_isects : tile_offsets[tile_id + 1];
+    const int32_t count       = static_cast<int32_t>(range_end - range_start);
+    const int32_t *perm       = flatten_ids + n_isects;
+
+    // this lane's pixels, as rasterize_to_pixels_3dgs_bwd_kernel keeps one
+    const float px = (float)(bx + lane % 8) + 0.5f;
+    float py[PIXELS], T_final[PIXELS], T[PIXELS], v_render_a[PIXELS];
+    float buffer[PIXELS][CDIM] = {0.f}, v_render_c[PIXELS][CDIM];
+    int32_t bin_final[PIXELS];
+#        pragma unroll
+    for(uint32_t p = 0; p < PIXELS; ++p)
+    {
+        const uint32_t i = by + lane / 8 + 4 * p, j = bx + lane % 8;
+        const int32_t pix_id = min(i * image_width + j, image_width * image_height - 1);
+        py[p]                = (float)i + 0.5f;
+        T_final[p]           = 1.0f - render_alphas[pix_id];
+        T[p]                 = T_final[p];
+#        pragma unroll
+        for(uint32_t k = 0; k < CDIM; ++k)
+        {
+            v_render_c[p][k] = v_render_colors[pix_id * CDIM + k];
+        }
+        v_render_a[p] = v_render_alphas[pix_id];
+        bin_final[p]  = (i < image_height && j < image_width) ? last_ids[pix_id] : -1;
+    }
+
+    // The gaussians behind every pixel's last one, and all of a masked tile, get zeros.
+    __shared__ int32_t wave_bin_final[WAVES];
+    const int32_t block_bin_final = wave_all_reduce(max(bin_final[0], bin_final[1]), rocprim::maximum<int32_t>());
+    if(lane == 0)
+    {
+        wave_bin_final[wave] = block_bin_final;
+    }
+    __syncthreads();
+    const bool masked = masks != nullptr && !masks[image_id * n_tiles + tile_id];
+    const int32_t used
+        = masked
+            ? 0
+            : min(count, 1 + max(max(wave_bin_final[0], wave_bin_final[1]), max(wave_bin_final[2], wave_bin_final[3])));
+    for(int32_t idx = used + tr; idx < count; idx += WAVES * WAVE)
+    {
+        float *slot = part + (int64_t)perm[range_start + idx] * GRADS;
+#        pragma unroll
+        for(uint32_t k = 0; k < GRADS; ++k)
+        {
+            slot[k] = 0.f;
+        }
+    }
+
+    __shared__ vec3 xy_opacity_batch[WAVE], conic_batch[WAVE];
+    __shared__ float rgbs_batch[WAVE * CDIM], sums[WAVES * WAVE * GRADS];
+    __shared__ uint32_t contributed[WAVES];
+    const float x0 = (float)bx + 0.5f, y0 = (float)by + 0.5f;
+
+    // batches of 32 gaussians from back to front; thread t fetches the t-th from the back
+    for(int32_t batch_end = used - 1; batch_end >= 0; batch_end -= WAVE)
+    {
+        const uint32_t batch_size = min((int32_t)WAVE, batch_end + 1);
+        if(tr < batch_size)
+        {
+            const int32_t g      = flatten_ids[range_start + batch_end - tr];
+            const vec2 xy        = means2d[g];
+            xy_opacity_batch[tr] = {xy.x, xy.y, opacities[g]};
+            conic_batch[tr]      = conics[g];
+#        pragma unroll
+            for(uint32_t k = 0; k < CDIM; ++k)
+            {
+                rgbs_batch[tr * CDIM + k] = colors[g * CDIM + k];
+            }
+        }
+        __syncthreads();
+
+        uint32_t todo   = __builtin_amdgcn_readfirstlane((uint32_t)__ballot(
+            lane < batch_size
+            && gaussian_reaches_rect(conic_batch[lane], xy_opacity_batch[lane], x0, y0, x0 + 7.f, y0 + 7.f)
+        ));
+        uint32_t walked = 0;
+        while(todo)
+        {
+            const uint32_t t  = __builtin_ctz(todo);
+            todo             &= todo - 1;
+            const vec3 conic = conic_batch[t], xy_opac = xy_opacity_batch[t];
+            float g[GRADS] = {0.f};
+            bool valid     = false;
+#        pragma unroll
+            for(uint32_t p = 0; p < PIXELS; ++p)
+            {
+                const vec2 delta        = {xy_opac.x - px, xy_opac.y - py[p]};
+                const GaussianWeight gw = eval_gaussian_weight(conic, delta.x, delta.y, xy_opac.z);
+                if(batch_end - (int32_t)t > bin_final[p] || !gw.valid)
+                {
+                    continue;
+                }
+                float v_rgb_local[CDIM] = {0.f};
+                vec3 v_conic_local      = {0.f, 0.f, 0.f};
+                vec2 v_xy_local         = {0.f, 0.f};
+                vec2 v_xy_abs_local     = {0.f, 0.f};
+                float v_opacity_local   = 0.f;
+                rasterize_to_pixels_3dgs_blend_bwd<CDIM>(
+                    conic,
+                    delta,
+                    xy_opac.z,
+                    gw.vis,
+                    gw.alpha,
+                    rgbs_batch + t * CDIM,
+                    v_render_c[p],
+                    v_render_a[p],
+                    T_final[p],
+                    backgrounds,
+                    ABS,
+                    T[p],
+                    buffer[p],
+                    v_rgb_local,
+                    v_conic_local,
+                    v_xy_local,
+                    v_xy_abs_local,
+                    v_opacity_local
+                );
+#        pragma unroll
+                for(uint32_t k = 0; k < CDIM; ++k)
+                {
+                    g[k] += v_rgb_local[k];
+                }
+                g[CDIM]     += v_conic_local.x;
+                g[CDIM + 1] += v_conic_local.y;
+                g[CDIM + 2] += v_conic_local.z;
+                g[CDIM + 3] += v_xy_local.x;
+                g[CDIM + 4] += v_xy_local.y;
+                g[CDIM + 5] += v_opacity_local;
+                if constexpr(ABS)
+                {
+                    g[CDIM + 6] += v_xy_abs_local.x;
+                    g[CDIM + 7] += v_xy_abs_local.y;
+                }
+                valid = true;
+            }
+            // if no lane of the wavefront uses the gaussian, skip it
+            if(!__ballot(valid))
+            {
+                continue;
+            }
+            walked                    |= 1u << t;
+            float *slot                = sums + (wave * WAVE + t) * GRADS;
+            // eight sums at a time, and a last one alone
+            constexpr uint32_t EIGHTS  = GRADS % 8 == 1 ? GRADS - 1 : GRADS;
+#        pragma unroll
+            for(uint32_t base = 0; base < EIGHTS; base += 8)
+            {
+                float v[8];
+#        pragma unroll
+                for(uint32_t k = 0; k < 8; ++k)
+                {
+                    v[k] = base + k < EIGHTS ? g[base + k] : 0.f;
+                }
+                const float sum = wave32_sum8(v, lane);
+                if(lane < 8 && base + lane < EIGHTS)
+                {
+                    slot[base + lane] = sum;
+                }
+            }
+            if constexpr(EIGHTS < GRADS)
+            {
+                const float sum = wave_all_reduce(g[EIGHTS], rocprim::plus<float>());
+                if(lane == 0)
+                {
+                    slot[EIGHTS] = sum;
+                }
+            }
+        }
+        if(lane == 0)
+        {
+            contributed[wave] = walked;
+        }
+        __syncthreads();
+
+        if(tr < batch_size)
+        {
+            float total[GRADS] = {0.f};
+#        pragma unroll
+            for(uint32_t w = 0; w < WAVES; ++w)
+            {
+                if(contributed[w] >> tr & 1)
+                {
+#        pragma unroll
+                    for(uint32_t k = 0; k < GRADS; ++k)
+                    {
+                        total[k] += sums[(w * WAVE + tr) * GRADS + k];
+                    }
+                }
+            }
+            float *slot = part + (int64_t)perm[range_start + batch_end - tr] * GRADS;
+#        pragma unroll
+            for(uint32_t k = 0; k < GRADS; ++k)
+            {
+                slot[k] = total[k];
+            }
+        }
+    }
+}
+
+// Adds the sums of each gaussian's intersections, [cum[g - 1], cum[g]) before the sort.
+// A lane owns a gaussian; a whole wavefront adds those of more than BIG tiles, for no
+// lane to walk a long list.
+template<uint32_t CDIM, bool ABS>
+__global__ void gather_isect_grads_kernel(
+    const int64_t n,
+    const int64_t *__restrict__ cum, // [n]
+    const float *__restrict__ part,  // [n_isects, GRADS]
+    vec2 *__restrict__ v_means2d_abs,
+    vec2 *__restrict__ v_means2d,
+    vec3 *__restrict__ v_conics,
+    float *__restrict__ v_colors,
+    float *__restrict__ v_opacities
+)
+{
+    constexpr uint32_t BIG = 8, GRADS = CDIM + (ABS ? 8 : 6);
+    const int64_t g     = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t lane = threadIdx.x % GSPLAT_WARP_SIZE;
+    const int64_t u0 = g < n && g > 0 ? cum[g - 1] : 0, u1 = g < n ? cum[g] : 0;
+    float s[GRADS] = {0.f};
+    uint64_t big   = __ballot(u1 - u0 > BIG);
+    while(big)
+    {
+        const uint32_t owner  = __builtin_ctzll(big);
+        big                  &= big - 1;
+        const int64_t start = __shfl(u0, owner), end = __shfl(u1, owner);
+        float acc[GRADS] = {0.f};
+        for(int64_t u = start + lane; u < end; u += GSPLAT_WARP_SIZE)
+        {
+#        pragma unroll
+            for(uint32_t k = 0; k < GRADS; ++k)
+            {
+                acc[k] += part[u * GRADS + k];
+            }
+        }
+#        pragma unroll
+        for(uint32_t k = 0; k < GRADS; ++k)
+        {
+            acc[k] = wave_all_reduce(acc[k], rocprim::plus<float>());
+            if(lane == owner)
+            {
+                s[k] = acc[k];
+            }
+        }
+    }
+    if(g >= n)
+    {
+        return;
+    }
+    if(u1 - u0 <= BIG)
+    {
+        for(int64_t u = u0; u < u1; ++u)
+        {
+#        pragma unroll
+            for(uint32_t k = 0; k < GRADS; ++k)
+            {
+                s[k] += part[u * GRADS + k];
+            }
+        }
+    }
+#        pragma unroll
+    for(uint32_t k = 0; k < CDIM; ++k)
+    {
+        v_colors[g * CDIM + k] = s[k];
+    }
+    v_conics[g]    = {s[CDIM], s[CDIM + 1], s[CDIM + 2]};
+    v_means2d[g]   = {s[CDIM + 3], s[CDIM + 4]};
+    v_opacities[g] = s[CDIM + 5];
+    if constexpr(ABS)
+    {
+        v_means2d_abs[g] = {s[CDIM + 6], s[CDIM + 7]};
+    }
+}
 #    endif
 
 template<uint32_t CDIM, typename scalar_t>
@@ -861,6 +1246,61 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
 #    endif
 
 #    if USE_ROCM
+        if constexpr(CDIM <= 32)
+        {
+            if(rasterize_blocks_to_pixels_3dgs_bwd_fits(means2d, colors, tile_size, flatten_ids))
+            {
+                const int64_t n_gauss = means2d.numel() / 2;
+                auto launch_blocks    = [&]<bool ABS>()
+                {
+                    at::Tensor part     = at::empty({n_isects, CDIM + (ABS ? 8 : 6)}, means2d.options());
+                    const int32_t *perm = flatten_ids.const_data_ptr<int32_t>() + n_isects;
+                    rasterize_blocks_to_pixels_3dgs_bwd_kernel<CDIM, ABS><<<grid, 128, 0, GET_CURRENT_STREAM()>>>(
+                        I,
+                        n_isects,
+                        reinterpret_cast<const vec2 *>(means2d.const_data_ptr<float>()),
+                        reinterpret_cast<const vec3 *>(conics.const_data_ptr<float>()),
+                        colors.const_data_ptr<float>(),
+                        opacities.const_data_ptr<float>(),
+                        backgrounds.has_value() ? backgrounds.value().const_data_ptr<float>() : nullptr,
+                        masks.has_value() ? masks.value().const_data_ptr<bool>() : nullptr,
+                        image_width,
+                        image_height,
+                        tile_width,
+                        tile_height,
+                        tile_offsets.const_data_ptr<int64_t>(),
+                        flatten_ids.const_data_ptr<int32_t>(),
+                        render_alphas.const_data_ptr<float>(),
+                        last_ids.const_data_ptr<int32_t>(),
+                        v_render_colors.const_data_ptr<float>(),
+                        v_render_alphas.const_data_ptr<float>(),
+                        part.data_ptr<float>()
+                    );
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                    gather_isect_grads_kernel<CDIM, ABS><<<(n_gauss + 255) / 256, 256, 0, GET_CURRENT_STREAM()>>>(
+                        n_gauss,
+                        reinterpret_cast<const int64_t *>(perm + n_isects),
+                        part.const_data_ptr<float>(),
+                        ABS ? reinterpret_cast<vec2 *>(v_means2d_abs.value().data_ptr<float>()) : nullptr,
+                        reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
+                        reinterpret_cast<vec3 *>(v_conics.data_ptr<float>()),
+                        v_colors.data_ptr<float>(),
+                        v_opacities.data_ptr<float>()
+                    );
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                };
+                if(v_means2d_abs.has_value())
+                {
+                    launch_blocks.template operator()<true>();
+                }
+                else
+                {
+                    launch_blocks.template operator()<false>();
+                }
+                return;
+            }
+        }
+
         uint32_t bs64_max_batch_size = 0;
         if(rocm_use_bs64_bwd<CDIM>(tile_size, bs64_max_batch_size, shmem_size))
         {

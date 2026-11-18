@@ -54,6 +54,51 @@ __device__ __forceinline__ GaussianWeight
     return out;
 }
 
+#ifdef USE_ROCM
+// Whether the gaussian can pass eval_gaussian_weight's alpha test at a pixel center in
+// [x0, x1] x [y0, y1]; true when it cannot decide. The exponent is smallest at the mean,
+// or else on an edge of the rectangle.
+__device__ __forceinline__ bool gaussian_reaches_rect(
+    const vec3 &conic,
+    const vec3 &xy_opacity, // (mean.x, mean.y, opacity)
+    const float x0,
+    const float y0,
+    const float x1,
+    const float y1
+)
+{
+    const float mx = xy_opacity.x, my = xy_opacity.y, a = conic.x, b = conic.y, c = conic.z;
+    // the margin covers the rounding of __expf in eval_gaussian_weight
+    const float cut = __logf(xy_opacity.z / ALPHA_THRESHOLD) + 1e-3f;
+    if(!(a > 0.f && c > 0.f && a * c - b * b > 0.f) || !(cut < 1e30f))
+    {
+        return true;
+    }
+    if(cut < 0.f)
+    {
+        return false;
+    }
+    auto sigma = [&](float dx, float dy)
+    {
+        return 0.5f * (a * dx * dx + c * dy * dy) + b * dx * dy;
+    };
+    auto clamp = [](float v, float lo, float hi)
+    {
+        return fminf(fmaxf(v, lo), hi);
+    };
+    if(sigma(clamp(mx, x0, x1) - mx, clamp(my, y0, y1) - my) <= cut)
+    {
+        return true;
+    }
+    const float dx0 = x0 - mx, dx1 = x1 - mx, dy0 = y0 - my, dy1 = y1 - my;
+    float best = sigma(clamp(-b * dy0 / a, dx0, dx1), dy0);
+    best       = fminf(best, sigma(clamp(-b * dy1 / a, dx0, dx1), dy1));
+    best       = fminf(best, sigma(dx0, clamp(-b * dx0 / c, dy0, dy1)));
+    best       = fminf(best, sigma(dx1, clamp(-b * dx1 / c, dy0, dy1)));
+    return best <= cut;
+}
+#endif
+
 // Forward: blend one gaussian into one pixel's running color/transmittance.
 // Returns true when the pixel has saturated (transmittance fell to the
 // threshold) and should stop accumulating -- the caller marks it done and the

@@ -528,10 +528,20 @@ RasterizeToPixels3DGSBwdResult rasterize_to_pixels_3dgs_bwd(
         CHECK_INPUT(masks.value());
     }
 
+#    ifdef USE_ROCM
+    const bool fill = !rasterize_blocks_to_pixels_3dgs_bwd_fits(means2d, colors, tile_size, flatten_ids);
+    auto like       = [&](const at::Tensor &x)
+    {
+        return fill ? at::zeros_like(x) : at::empty_like(x);
+    };
+    at::Tensor v_means2d = like(means2d), v_conics = like(conics), v_colors = like(colors);
+    at::Tensor v_opacities = like(opacities);
+#    else
     at::Tensor v_means2d   = at::zeros_like(means2d);
     at::Tensor v_conics    = at::zeros_like(conics);
     at::Tensor v_colors    = at::zeros_like(colors);
     at::Tensor v_opacities = at::zeros_like(opacities);
+#    endif
     at::Tensor v_means2d_abs;
     if(absgrad)
     {

@@ -153,6 +153,15 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernels(
     at::Tensor last_ids // [..., image_height, image_width]
 );
 
+#ifdef USE_ROCM
+// Whether rasterize_to_pixels_3dgs_bwd takes the kernels of 32-lane GPUs, which write
+// every gradient: intersect_tile left each intersection's index before the sort and the
+// gaussians' prefix counts behind flatten_ids, and a tile's sums fit the shared memory.
+bool rasterize_blocks_to_pixels_3dgs_bwd_fits(
+    const at::Tensor &means2d, const at::Tensor &colors, const uint32_t tile_size, const at::Tensor &flatten_ids
+);
+#endif
+
 void launch_rasterize_to_pixels_3dgs_bwd_kernel(
     // Gaussian parameters
     const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]

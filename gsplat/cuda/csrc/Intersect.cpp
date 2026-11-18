@@ -29,6 +29,9 @@
 #include "Config.h"
 #include "Intersect.h"  // where the launch function is declared
 #include "TorchUtils.h" // to_torch_op, TorchArgDef
+#ifdef USE_ROCM
+#    include "Utils.h" // device_warp_size
+#endif
 
 namespace gsplat
 {
@@ -254,7 +257,11 @@ TileIntersectResult intersect_tile(
             c10::nullopt  // flatten_ids
         );
         // Explicit int64 to match the kernel's int64 read of cum_tiles_per_gauss.
+#ifdef USE_ROCM
+        cum_tiles_per_gauss = cumsum_tiles_per_gauss(tiles_per_gauss);
+#else
         cum_tiles_per_gauss = at::cumsum(tiles_per_gauss.view({-1}), 0, at::kLong);
+#endif
         n_isects            = cum_tiles_per_gauss[-1].item<int64_t>();
         if(segmented)
         {
@@ -313,6 +320,26 @@ TileIntersectResult intersect_tile(
                 flatten_ids_sorted
             );
         }
+#ifdef USE_ROCM
+        else if(device_warp_size() == 32)
+        {
+            // The sort carries each intersection's index, where those of a gaussian are
+            // contiguous. The indices and the gaussians' prefix counts stay in the storage
+            // behind flatten_ids, for rasterize_to_pixels_3dgs_bwd to add up a gaussian's
+            // intersections without atomics.
+            at::Tensor all   = at::empty({2 * (n_isects + n_elements)}, flatten_ids.options());
+            at::Tensor index = all.narrow(0, n_isects, n_isects), perm = at::empty_like(index);
+            at::arange_out(index, n_isects);
+            radix_sort_double_buffer(n_isects, image_n_bits, tile_n_bits, isect_ids, index, isect_ids_sorted, perm);
+            if(perm.data_ptr() != index.data_ptr())
+            {
+                index.copy_(perm); // the sort ends in either buffer
+            }
+            flatten_ids_sorted = all.narrow(0, 0, n_isects);
+            at::index_select_out(flatten_ids_sorted, flatten_ids, 0, index);
+            all.narrow(0, 2 * n_isects, 2 * n_elements).view(at::kLong).copy_(cum_tiles_per_gauss);
+        }
+#endif
         else
         {
             radix_sort_double_buffer(

@@ -584,6 +584,30 @@ __global__ void projection_ewa_3dgs_fused_bwd_kernel(
     unsigned long long warp_active_mask = __activemask();
 
     #if USE_ROCM
+    // One camera: each thread is the only writer of its gaussian's gradients.
+    if(C == 1 && v_covars == nullptr && v_viewmats == nullptr)
+    {
+        vec4 v_quat(0.f);
+        vec3 v_scale(0.f);
+        quat_scale_to_covar_vjp(quat, scale, quat_to_rotmat(quat), v_covar, v_quat, v_scale);
+        if(v_means != nullptr)
+        {
+            v_means    += bid * N * 3 + gid * 3;
+            v_means[0]  = v_mean.x;
+            v_means[1]  = v_mean.y;
+            v_means[2]  = v_mean.z;
+        }
+        v_quats     += bid * N * 4 + gid * 4;
+        v_quats[0]   = v_quat.x;
+        v_quats[1]   = v_quat.y;
+        v_quats[2]   = v_quat.z;
+        v_quats[3]   = v_quat.w;
+        v_scales    += bid * N * 3 + gid * 3;
+        v_scales[0]  = v_scale.x;
+        v_scales[1]  = v_scale.y;
+        v_scales[2]  = v_scale.z;
+        return;
+    }
     if(v_means != nullptr)
     {
         manual_dynamic_reduce_sum_vec3(v_mean, gid, warp_thread_id, warp_active_mask);

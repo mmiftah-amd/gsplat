@@ -1083,6 +1083,16 @@ void launch_intersect_offset_kernels(
     merge_streams();
 }
 
+#if USE_ROCM
+at::Tensor cumsum_tiles_per_gauss(const at::Tensor &tiles_per_gauss)
+{
+    at::Tensor cum = tiles_per_gauss.view({-1}).to(at::kLong);
+    int64_t *sums  = cum.data_ptr<int64_t>();
+    CUB_WRAPPER(cub::DeviceScan::InclusiveSum, sums, sums, cum.numel(), GET_CURRENT_STREAM());
+    return cum;
+}
+#endif
+
 // https://nvidia.github.io/cccl/cub/api/structcub_1_1DeviceRadixSort.html
 // DoubleBuffer reduce the auxiliary memory usage from O(N+P) to O(P)
 void radix_sort_double_buffer(

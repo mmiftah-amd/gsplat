@@ -274,6 +274,12 @@ void launch_intersect_offset_kernels(
     at::Tensor offsets // [..., tile_height, tile_width]
 );
 
+#ifdef USE_ROCM
+// The inclusive sum of tiles_per_gauss as int64 [n]. at::cumsum holds up its stream while
+// another one runs.
+at::Tensor cumsum_tiles_per_gauss(const at::Tensor &tiles_per_gauss);
+#endif
+
 void radix_sort_double_buffer(
     const int64_t n_isects,
     const uint32_t image_n_bits,
