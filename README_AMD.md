@@ -3,15 +3,19 @@
 Exact, copy-pasteable commands to clean, build (including all experimental
 features), and test `gsplat` on AMD ROCm.
 
-## Verified environment
+## Supported environment
+
+Only the ROCm 10.3 nightly builds are supported, with the PyTorch nightly builds for
+ROCm 10.3.
 
 | Component | Value |
 |---|---|
-| GPU | AMD Instinct MI300X (gfx942, wavefront-64); also run on MI325X (gfx942) and MI355X (gfx950) |
-| ROCm SDK | 10.1.0 (pip `rocm[libraries,devel,device-gfx942]`) |
-| PyTorch | 2.14.0+rocm10.1.0 (HIP build) |
+| GPU | AMD Instinct MI300X, MI325X (gfx942) and MI355X (gfx950), wavefront-64; AMD Radeon RX 9070 XT (gfx1201, wavefront-32) |
+| ROCm SDK | 10.3 nightly (pip `rocm[libraries,devel,device-gfx942]`) |
+| PyTorch | nightly build for ROCm 10.3 (HIP build) |
+| Last verified with | ROCm 10.3.0a20261109 and torch 2.15.0+rocm10.3.0a20261109, on the RX 9070 XT |
 | Python | 3.12 |
-| Compiler | `hipcc` from the pip `_rocm_sdk_devel` package |
+| Compiler | `hipcc` from the ROCm 10.3 nightly SDK (the pip `devel` extra) |
 | Host GCC for clang pin | `/usr/lib/gcc/x86_64-linux-gnu/13` (12/13/14 present; 13 chosen) |
 
 > The build pins ROCm's clang to GCC 13 via `--gcc-install-dir` because GCC 14's
@@ -20,18 +24,19 @@ features), and test `gsplat` on AMD ROCm.
 
 ---
 
-## Install PyTorch and ROCm 10.1
+## Install PyTorch and ROCm 10.3 nightly
 
-Create a virtual environment, then install the stable ROCm 10.1 torch wheel
+Create a virtual environment, then install the nightly ROCm 10.3 torch wheel
 and the matching SDK (`hipcc` comes from the `devel` extra). `device-gfx942`
-is MI300X / MI325X; swap it for another `[device-*]` extra if needed.
+is MI300X / MI325X; swap it for another `[device-*]` extra if needed
+(`device-gfx950` for MI355X, `device-gfx1201` for the RX 9070 XT).
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ \
-    "torch[device-gfx942]==2.14.0+rocm10.1.0" \
-    "rocm[libraries,devel,device-gfx942]==10.1.0"
+pip install --pre --index-url https://nightly.repo.amd.com/rocm/whl-next/ \
+    "torch[device-gfx942]" \
+    "rocm[libraries,devel,device-gfx942]"
 ```
 
 ---
@@ -187,7 +192,10 @@ grep -E '^FAILED' /tmp/pytest.log
 
 ---
 
-## Expected result (MI300X, gfx942, ROCm 10.1.0 / torch 2.14.0+rocm10.1.0)
+## Expected result (MI300X, gfx942)
+
+The MI300X numbers below were recorded with ROCm 10.1.0 and torch 2.14.0+rocm10.1.0
+and have not been recorded again on ROCm 10.3 nightly.
 
 - Build: wheel + all JIT/experimental extensions compile with **0 errors**.
 - Tests: **2572 passed, 145 skipped, ~15 xfailed, ~1 xpassed, 8 failed** (~15-18 min; the xfail/xpass split varies by one test between runs).
@@ -213,9 +221,9 @@ grep -E '^FAILED' /tmp/pytest.log
   `examples/simple_trainer.py` trains with `gsplat.optimizers.fused_training` where its
   configuration allows it (`--no-fused` turns that off): Adam steps fused with the
   projection's backward, SH updates applied when a gaussian is next rendered, and a
-  fused L1 + SSIM loss. On an RX 9070 XT (gfx1201), garden with `mcmc` and one million
-  gaussians trains 30,000 steps in about 135 s (about 380 s with `--no-fused`), against
-  about 660 s without these.
+  fused L1 + SSIM loss. On an RX 9070 XT (gfx1201) with ROCm 10.3 nightly, garden with
+  `mcmc` and one million gaussians trains 30,000 steps in about 135 s (about 400 s with
+  `--no-fused`), against about 660 s without these.
 - On MI355X (gfx950) install the `device-gfx950` extras instead of `device-gfx942`
   (otherwise `hipErrorInvalidKernelFile`); results are in the same range.
 
