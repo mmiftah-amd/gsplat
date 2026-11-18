@@ -30,6 +30,9 @@
 #    include "CameraWrappers.h"
 #    include "ExternalDistortionWrappers.h"
 #endif
+#ifdef USE_ROCM
+#    include "csrc/FusedTraining.h"
+#endif
 
 namespace gsplat
 {
@@ -80,6 +83,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .value("BIVARIATE_WINDSHIELD", gsplat::extdist::ModelType::BIVARIATE_WINDSHIELD);
 
     m.def("null", &gsplat::null);
+#ifdef USE_ROCM
+    m.def("l1_ssim", &gsplat::l1_ssim);
+    m.def("fused_sh", &gsplat::fused_sh);
+    m.def("fused_geometry", &gsplat::fused_geometry);
+#endif
     m.def(
         "build_config",
         []()

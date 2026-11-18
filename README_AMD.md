@@ -205,6 +205,17 @@ grep -E '^FAILED' /tmp/pytest.log
   ~6 ms at `tile_size=8` vs ~16 ms at the default `tile_size=16`; CDIM=3 ~1.9 ms vs
   ~2.2 ms. `tile_size=8` for dense 3DGS rasterization is ROCm-only; CUDA builds keep
   `{4, 16}`.
+- **32-lane GPUs (Radeon RX, gfx10 and later):** the kernels take the wavefront size of
+  the target, so the same sources build for 32 and 64 lanes. At the default
+  `tile_size=16` and up to 32 channels, `rasterization()` then uses kernels in which a
+  wavefront owns an 8x8 pixel block and skips the gaussians that do not reach it, and
+  the backward sums per intersection and gathers per gaussian instead of using atomics.
+  `examples/simple_trainer.py` trains with `gsplat.optimizers.fused_training` where its
+  configuration allows it (`--no-fused` turns that off): Adam steps fused with the
+  projection's backward, SH updates applied when a gaussian is next rendered, and a
+  fused L1 + SSIM loss. On an RX 9070 XT (gfx1201), garden with `mcmc` and one million
+  gaussians trains 30,000 steps in about 135 s (about 380 s with `--no-fused`), against
+  about 660 s without these.
 - On MI355X (gfx950) install the `device-gfx950` extras instead of `device-gfx942`
   (otherwise `hipErrorInvalidKernelFile`); results are in the same range.
 

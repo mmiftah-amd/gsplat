@@ -111,6 +111,8 @@ def _update_param_with_optimizer(
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
         names: A list of key names to update. If None, update all. Default: None.
     """
+    if torch.version.hip and getattr(params, "fused", None) is not None:
+        params.fused.restructure()  # FusedTraining: its delayed SH updates go in first
     if names is None:
         # If names is not provided, update all parameters
         names = list(params.keys())
@@ -477,6 +479,9 @@ def inject_noise_to_position(
       * ``cuda`` / ``native`` / unset (default) — prefer the fused CUDA kernel.
       * ``torch`` / ``pytorch`` / ``py`` — force the PyTorch fallback.
     """
+    if torch.version.hip and getattr(params, "noise_added", False):
+        params.noise_added = False  # FusedTraining.step() added this step's noise
+        return
     resolved_noise_scale = _resolve_noise_scale(noise_scale, scaler)
     if not _force_torch_backend:
         # Priority 1: native CUDA (single kernel launch)

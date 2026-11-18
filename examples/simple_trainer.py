@@ -58,6 +58,7 @@ from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
+from gsplat.optimizers.fused_training import FusedTraining
 from gsplat.rendering import rasterization, RasterizeMode
 
 try:
@@ -263,6 +264,8 @@ class Config:
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
     with_eval3d: bool = False
+    # Train with the fused kernels on ROCm where the config allows it
+    fused: bool = True
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -521,6 +524,9 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
+        self.fused = None
+        if cfg.fused and world_size == 1 and FusedTraining.supports(cfg, self.device):
+            self.fused = FusedTraining(self.splats, self.optimizers, cfg, self.scene)
 
         # Compression Strategy
         self.compression_method = None
@@ -668,6 +674,12 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         splats = splats if splats is not None else self.splats
+        if self.fused is not None:
+            if torch.is_grad_enabled():
+                return self.fused.rasterize(
+                    camtoworlds, Ks, width, height, masks=masks, **kwargs
+                )
+            self.fused.flush()
         means = splats["means"]  # [N, 3]
         # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
@@ -861,6 +873,8 @@ class Runner:
             persistent_workers=True,
             pin_memory=True,
         )
+        if self.fused is not None:
+            trainloader = self.fused.cached_views(self.trainset, trainloader)
         trainloader_iter = iter(trainloader)
 
         # Training loop.
@@ -961,14 +975,19 @@ class Runner:
                 l1loss = l1_loss(colors[masks], pixels[masks]).mean()
                 colors_ssim = colors * masks[..., None]
                 pixels_ssim = pixels * masks[..., None]
+            elif self.fused is not None:
+                loss, l1loss, ssimloss = self.fused.loss(
+                    colors, pixels, cfg.ssim_lambda
+                )
             else:
                 l1loss = l1_loss(colors, pixels).mean()
                 colors_ssim = colors
                 pixels_ssim = pixels
-            ssimloss = ssim_loss(
-                colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
-            )
-            loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+            if masks is not None or self.fused is None:
+                ssimloss = ssim_loss(
+                    colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
+                )
+                loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -1000,14 +1019,16 @@ class Runner:
                 loss += post_processing_reg_loss
 
             # regularizations
-            if cfg.opacity_reg > 0.0:
+            if cfg.opacity_reg > 0.0 and self.fused is None:
                 loss += cfg.opacity_reg * opacity_reg_loss(self.splats["opacities"])
-            if cfg.scale_reg > 0.0:
+            if cfg.scale_reg > 0.0 and self.fused is None:
                 loss += cfg.scale_reg * scale_reg_loss(self.splats["scales"])
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
+            if self.fused is None or step % 10 == 0:  # .item() waits for the GPU
+                last_loss = loss.item()
+            desc = f"loss={last_loss:.3f}| sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -1046,6 +1067,9 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
+            if self.fused is not None:  # before the splats are saved or exported
+                if step + 1 in [*cfg.save_steps, *cfg.ply_steps, max_steps]:
+                    self.fused.flush()
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1140,7 +1164,9 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # optimize
-            for optimizer in self.optimizers.values():
+            if self.fused is not None:
+                self.fused.step(step, schedulers[0].gamma)
+            for optimizer in self.optimizers.values() if self.fused is None else ():
                 if cfg.visible_adam:
                     optimizer.step(visibility_mask)
                 else:

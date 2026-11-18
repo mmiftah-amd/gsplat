@@ -174,7 +174,8 @@ class MCMCStrategy(Strategy):
                     f"Now having {len(params['means'])} GSs."
                 )
 
-            torch.cuda.empty_cache()
+            if getattr(params, "fused", None) is None:  # FusedTraining keeps it
+                torch.cuda.empty_cache()
 
         # add noise to GSs (stop after noise_injection_stop_iter if set)
         noise_stop = (
