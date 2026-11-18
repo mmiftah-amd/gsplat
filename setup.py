@@ -641,6 +641,10 @@ def _make_rocm_extension(sources, extra_include_paths, params):
             cxx_flags.append(flag)
         if flag.startswith("-D") and flag not in hipcc_flags:
             hipcc_flags.append(flag)
+    if "-use_fast_math" in params.extra_cuda_cflags:
+        # As nvcc's flag on the CUDA build (FAST_MATH=0 drops it), which keeps NaN and
+        # infinity: the kernels' guards against them rely on that.
+        hipcc_flags += ["-ffast-math", "-fno-finite-math-only"]
 
     extra_compile_args["nvcc"] = hipcc_flags
 
