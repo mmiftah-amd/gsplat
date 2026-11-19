@@ -401,6 +401,7 @@ def rasterization(
         scales: The scales of the Gaussians. [..., N, 3]
         opacities: The opacities of the Gaussians. [..., N]
         colors: The colors of the Gaussians. [..., (C,) N, D] for post-activation colors, or [N, K, D] for SH coefficients (shared across batch/camera dims).
+          On ROCm, a :class:`gsplat.optimizers.fused_training.DelayedSH` can stand in for the SH coefficients of one view.
         viewmats: The world-to-cam transformation of the cameras. [..., C, 4, 4]
         Ks: The camera intrinsics. [..., C, 3, 3]
         width: The width of the image.
@@ -554,6 +555,54 @@ def rasterization(
             "the non-eval3d path only supports RendererConfig_MixedBatch."
         )
     renderer_config_impl = _renderer_config_type(renderer_config)
+
+    if torch.version.hip and colors is not None and not isinstance(colors, Tensor):
+        from .optimizers.fused_training import DelayedSH
+
+        if isinstance(colors, DelayedSH):
+            # one plain view of 3DGS: the stages below with the colors alongside them
+            others = (
+                covars,
+                extra_signals,
+                rays,
+                radial_coeffs,
+                tangential_coeffs,
+                thin_prism_coeffs,
+                lidar_coeffs,
+                external_distortion_coeffs,
+                viewmats_rs,
+            )
+            out = colors.rasterize_view(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=sh_degree,
+                near_plane=near_plane,
+                far_plane=far_plane,
+                radius_clip=radius_clip,
+                eps2d=eps2d,
+                tile_size=tile_size,
+                backgrounds=backgrounds,
+                render_mode=render_mode,
+                absgrad=absgrad,
+                rasterize_mode=rasterize_mode,
+                camera_model=camera_model,
+                plain=all(x is None for x in others)
+                and not (packed or sparse_grad or distributed or segmented)
+                and not (with_ut or with_eval3d or return_normals)
+                and global_z_order
+                and channel_chunk > 0
+                and rolling_shutter == RollingShutterType.GLOBAL
+                and isinstance(renderer_config, RendererConfig_MixedBatch),
+            )
+            if out is not None:
+                return out
+            colors = colors.coefficients()
 
     # Both paths run the single C++ orchestrator. `distributed` is honored as
     # passed (no world_size-based downgrade): at one rank the gathers/scatters are

@@ -41,6 +41,7 @@ from datasets.traj import (
 from gsplat.losses import (
     depth_l1_loss,
     l1_loss,
+    l1_ssim_loss,
     opacity_reg_loss,
     scale_reg_loss,
     ssim_loss,
@@ -58,7 +59,12 @@ from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
-from gsplat.optimizers.fused_training import FusedTraining
+from gsplat.optimizers.fused_training import (
+    DelayedSH,
+    FusedTraining,
+    cached_views,
+    morton_order,
+)
 from gsplat.rendering import rasterization, RasterizeMode
 
 try:
@@ -524,9 +530,17 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
-        self.fused = None
+        # the fused step, or else its parts that fit the stock step
+        self.fused, self.delayed_sh = None, None
         if cfg.fused and world_size == 1 and FusedTraining.supports(cfg, self.device):
             self.fused = FusedTraining(self.splats, self.optimizers, cfg, self.scene)
+            self.delayed_sh = self.fused
+        elif (
+            cfg.fused
+            and world_size == 1
+            and FusedTraining.supports_delayed_sh(cfg, self.device)
+        ):
+            self.delayed_sh = DelayedSH(self.splats, self.optimizers)
 
         # Compression Strategy
         self.compression_method = None
@@ -674,12 +688,13 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         splats = splats if splats is not None else self.splats
-        if self.fused is not None:
-            if torch.is_grad_enabled():
-                return self.fused.rasterize(
-                    camtoworlds, Ks, width, height, masks=masks, **kwargs
-                )
-            self.fused.flush()
+        training = torch.is_grad_enabled() and splats is self.splats
+        if self.fused is not None and training:
+            return self.fused.rasterize(
+                camtoworlds, Ks, width, height, masks=masks, **kwargs
+            )
+        if self.delayed_sh is not None and not training:
+            self.delayed_sh.flush()  # sh0 and shN are read below
         means = splats["means"]  # [N, 3]
         # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
@@ -703,6 +718,8 @@ class Runner:
                 colors = torch.cat(
                     [splats["sh0"].half(), splats["shN"].half()], 1
                 )  # [N, K, 3]
+            elif self.delayed_sh is not None and training:
+                colors = self.delayed_sh  # stands in for the coefficients
             else:
                 colors = torch.cat([splats["sh0"], splats["shN"]], 1)  # [N, K, 3]
 
@@ -873,8 +890,8 @@ class Runner:
             persistent_workers=True,
             pin_memory=True,
         )
-        if self.fused is not None:
-            trainloader = self.fused.cached_views(self.trainset, trainloader)
+        if self.delayed_sh is not None:
+            trainloader = cached_views(self.trainset, trainloader, self.device)
         trainloader_iter = iter(trainloader)
 
         # Training loop.
@@ -975,15 +992,13 @@ class Runner:
                 l1loss = l1_loss(colors[masks], pixels[masks]).mean()
                 colors_ssim = colors * masks[..., None]
                 pixels_ssim = pixels * masks[..., None]
-            elif self.fused is not None:
-                loss, l1loss, ssimloss = self.fused.loss(
-                    colors, pixels, cfg.ssim_lambda
-                )
+            elif self.delayed_sh is not None:
+                loss, l1loss, ssimloss = l1_ssim_loss(colors, pixels, cfg.ssim_lambda)
             else:
                 l1loss = l1_loss(colors, pixels).mean()
                 colors_ssim = colors
                 pixels_ssim = pixels
-            if masks is not None or self.fused is None:
+            if masks is not None or self.delayed_sh is None:
                 ssimloss = ssim_loss(
                     colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
                 )
@@ -1024,9 +1039,12 @@ class Runner:
             if cfg.scale_reg > 0.0 and self.fused is None:
                 loss += cfg.scale_reg * scale_reg_loss(self.splats["scales"])
 
+            if self.delayed_sh is not None:  # the splats that are saved or exported
+                if step + 1 in [*cfg.save_steps, *cfg.ply_steps, max_steps]:
+                    self.delayed_sh.flush()
             loss.backward()
 
-            if self.fused is None or step % 10 == 0:  # .item() waits for the GPU
+            if self.delayed_sh is None or step % 10 == 0:  # .item() waits for the GPU
                 last_loss = loss.item()
             desc = f"loss={last_loss:.3f}| sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1067,9 +1085,6 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
-            if self.fused is not None:  # before the splats are saved or exported
-                if step + 1 in [*cfg.save_steps, *cfg.ply_steps, max_steps]:
-                    self.fused.flush()
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1210,6 +1225,10 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+            if self.fused is None and getattr(self.delayed_sh, "state", 0) is None:
+                # DelayedSH after a refinement; FusedTraining orders them by itself
+                if isinstance(self.cfg.strategy, MCMCStrategy):
+                    morton_order(self.splats, self.optimizers, self.scene)
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:

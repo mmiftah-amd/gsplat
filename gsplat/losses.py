@@ -201,6 +201,55 @@ def ssim_loss(
     return 1.0 - torch_ssim_loss(img1, img2, window, window_size, channel).mean()
 
 
+def l1_ssim_loss(pred: Tensor, target: Tensor, ssim_lambda: float):
+    """The photometric loss of 3DGS, ``lerp(L1, 1 - SSIM, ssim_lambda)``, with its terms.
+
+    On ROCm GPUs with 32-lane wavefronts, one image of three channels takes a single
+    kernel per direction where :func:`ssim_loss` would use ``fused_ssim``, with the same
+    result. Otherwise this is :func:`l1_loss` and :func:`ssim_loss`.
+
+    Args:
+        pred: Rendered images, shape ``(B, H, W, C)``, values in ``[0, 1]``.
+        target: Ground-truth images, same shape as *pred*.
+        ssim_lambda: Weight of the SSIM term.
+
+    Returns:
+        The scalar loss, and the mean L1 loss and the SSIM loss detached, for logging.
+    """
+    if (
+        torch.version.hip
+        and isinstance(ssim_lambda, (int, float))
+        and pred.is_cuda
+        and pred.dim() == 4
+        and pred.shape[0] == 1
+        and pred.shape[-1] == 3
+        and min(pred.shape[1:3]) > 10
+        and target.shape == pred.shape
+        and target.device == pred.device
+        and target.dtype == pred.dtype == torch.float32
+        and not target.requires_grad
+        and torch.cuda.get_device_properties(pred.device).warp_size == 32
+        and _has_fused_ssim()
+    ):
+        from .optimizers.fused_training import _L1SSIM
+
+        loss, terms = _L1SSIM.apply(
+            pred.contiguous(), target.contiguous(), float(ssim_lambda)
+        )
+        return loss, terms[0], terms[1]
+    l1 = l1_loss(pred, target).mean()
+    ssim = ssim_loss(pred.permute(0, 3, 1, 2), target.permute(0, 3, 1, 2))
+    return torch.lerp(l1, ssim, ssim_lambda), l1.detach(), ssim.detach()
+
+
+def _has_fused_ssim() -> bool:
+    try:
+        import fused_ssim  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Depth losses
 # ---------------------------------------------------------------------------

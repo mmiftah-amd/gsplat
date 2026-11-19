@@ -229,6 +229,63 @@ and have not been recorded again on ROCm 10.3 nightly.
 
 ---
 
+## A training loop of your own on ROCm
+
+`examples/simple_trainer.py` fuses its whole step where it can. Two parts of that work in
+any loop that calls `rasterization()` on one view per optimizer step, and keep the loop's
+own autograd and `torch.optim.Adam` optimizers. Both are for GPUs with 32-lane wavefronts,
+as the RX 9070 XT.
+
+```python
+from gsplat.losses import l1_ssim_loss
+from gsplat.optimizers.fused_training import DelayedSH
+
+# splats: a ParameterDict with "sh0" [N, 1, 3] and "shN" [N, K - 1, 3], K <= 16;
+# optimizers: a dict by the same names, torch.optim.Adam with the same betas and eps
+sh = DelayedSH(splats, optimizers)
+...
+renders, alphas, info = rasterization(
+    means, quats, scales, opacities,
+    sh,  # in place of torch.cat([sh0, shN], 1)
+    viewmats, Ks, width, height, sh_degree=sh_degree, packed=False,
+)
+loss, l1, ssim = l1_ssim_loss(renders, pixels, 0.2)  # lerp(L1, 1 - SSIM, 0.2)
+loss.backward()
+for optimizer in optimizers.values():  # as before: sh0 and shN get no gradient here
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+...
+sh.flush()  # before sh0 or shN are read: a save, an export, a copy of the splats
+sh.restructure()  # before Gaussians are added, removed or moved by code of your own
+sh.close()  # to go on without it
+```
+
+- `DelayedSH` applies the Adam steps of the SH coefficients when a Gaussian is next
+  rendered, in the optimizers' own state, and computes the colors alongside the tile
+  intersection. The steps are Adam's, with one difference from `rasterization()`:
+  positions and camera poses get no gradient through the view direction of the colors.
+  gsplat's strategies call `restructure()` themselves.
+- It covers one view per `rasterization()` and one `backward()` per step of the
+  optimizers, with `packed=False`, a pinhole, ortho or fisheye camera and none of
+  `rasterization()`'s other features. The SH step is taken in `backward()`, so every
+  `backward()` is followed by one step of the optimizers. Training outside that raises:
+  another case of `rasterization()`, a render between a render and its `backward()`, a
+  second `backward()` before the optimizers step, a gradient on `sh0` or `shN` from
+  elsewhere (as of a regularizer), SH learning rates that leave their ratio, or
+  optimizers with weight decay, amsgrad or other betas. Without gradients it renders
+  any case. A render changes its state, so use it from one thread.
+- `l1_ssim_loss` is one kernel per direction for one image of three channels where
+  `ssim_loss` would use `fused_ssim`, and `l1_loss` with `ssim_loss` otherwise. The two
+  terms it returns are detached, for logging.
+- `examples/simple_trainer.py` uses these parts by itself where its fused step does not
+  apply, as with `--post_processing`. With them and its stock step otherwise, garden
+  with `mcmc` and one million gaussians trains 30,000 steps in about 155 s on an
+  RX 9070 XT with ROCm 10.3 nightly, against about 400 s without and about 135 s fully
+  fused. (No option selects that combination for garden, where the fused step applies;
+  the time is from a run with the fused step ruled out.)
+
+---
+
 ## Key gotchas (why each step matters)
 
 | Gotcha | Consequence if skipped | Guard |

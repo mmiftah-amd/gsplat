@@ -107,6 +107,15 @@ inline __device__ bool sh_catch_up(
     return touched;
 }
 
+// Leaves a render's color gradient vc of a Gaussian for its next sh_catch_up().
+inline __device__ void sh_pend(int32_t &st, float *__restrict__ pend, const float *__restrict__ vc, const int degree)
+{
+    pend[3]  = st & 8 ? vc[0] : 0.f;
+    pend[4]  = st & 16 ? vc[1] : 0.f;
+    pend[5]  = st & 32 ? vc[2] : 0.f;
+    st      |= degree + 1;
+}
+
 // Brings the Gaussians the view sees (with radii, else all) to step t, and with radii
 // writes the colors max(SH + 0.5, 0). 16 lanes per Gaussian; lane k < K owns coefficient
 // k, in sh0 for k = 0, whose learning rate is lr_scale times that of shN.
@@ -217,7 +226,42 @@ at::Tensor fused_sh(
 )
 {
     DEVICE_GUARD(table);
-    const int64_t N   = state.numel();
+    const int64_t N = state.numel();
+    TORCH_CHECK(sh.size() == 2 && m.size() == 2 && v.size() == 2, "sh, m and v must hold two tensors: sh0's and shN's");
+    for(const auto *tensors: {&sh, &m, &v})
+    {
+        for(const at::Tensor &x: *tensors)
+        {
+            TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "sh, m and v must hold contiguous CUDA tensors");
+        }
+    }
+    CHECK_INPUT(state);
+    CHECK_INPUT(pend);
+    CHECK_INPUT(table);
+    TORCH_CHECK(sh[1].dim() == 3 && sh[1].size(1) <= 15, "shN must have shape [N, K - 1, 3], K <= 16");
+    TORCH_CHECK(
+        sh[0].numel() == 3 * N
+            && m[0].numel() == 3 * N
+            && v[0].numel() == 3 * N
+            && sh[1].size(0) == N
+            && m[1].sizes() == sh[1].sizes()
+            && v[1].sizes() == sh[1].sizes()
+            && pend.numel() == 6 * N,
+        "sh0, shN, their moments, state and pend must be of the same gaussians"
+    );
+    TORCH_CHECK(table.size(0) > t, "table must hold step ", t);
+    if(radii)
+    {
+        CHECK_INPUT(means.value());
+        CHECK_INPUT(c2w.value());
+        CHECK_INPUT(radii.value());
+        TORCH_CHECK(
+            means.value().numel() == 3 * N && radii.value().numel() == 2 * N && c2w.value().numel() >= 12,
+            "means [N, 3], radii [1, N, 2] and c2w [3, 4] must fit the state of ",
+            N,
+            " gaussians"
+        );
+    }
     at::Tensor colors = radii ? at::empty({N, 3}, table.options()) : at::Tensor();
     if(N)
     {
@@ -248,6 +292,51 @@ at::Tensor fused_sh(
         );
     }
     return colors;
+}
+
+// For a render that takes its colors from fused_sh(): leaves their gradients for the next
+// fused_sh(), of the Gaussians the view saw.
+__global__ void fused_sh_grad_kernel(
+    const int N,
+    const int degree,
+    const int32_t *__restrict__ radii,
+    const float *__restrict__ v_colors,
+    int32_t *__restrict__ state,
+    float *__restrict__ pend
+)
+{
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if(g < N && radii[2 * g] > 0 && radii[2 * g + 1] > 0)
+    {
+        sh_pend(state[g], pend + g * 6, v_colors + g * 3, degree);
+    }
+}
+
+void fused_sh_grad(at::Tensor v_colors, at::Tensor radii, int64_t degree, at::Tensor state, at::Tensor pend)
+{
+    DEVICE_GUARD(state);
+    const int64_t N = state.numel();
+    CHECK_INPUT(v_colors);
+    CHECK_INPUT(radii);
+    CHECK_INPUT(state);
+    CHECK_INPUT(pend);
+    TORCH_CHECK(
+        v_colors.numel() == 3 * N && radii.numel() == 2 * N && pend.numel() == 6 * N,
+        "v_colors [N, 3], radii [1, N, 2] and pend [N, 6] must fit the state of ",
+        N,
+        " gaussians"
+    );
+    if(N)
+    {
+        fused_sh_grad_kernel<<<(N + 255) / 256, 256, 0, GET_CURRENT_STREAM()>>>(
+            N,
+            degree,
+            radii.data_ptr<int32_t>(),
+            v_colors.data_ptr<float>(),
+            state.data_ptr<int32_t>(),
+            pend.data_ptr<float>()
+        );
+    }
 }
 
 // A parameter tensor with its bias-corrected step size, and the D values of a Gaussian.
@@ -298,8 +387,9 @@ struct AdamValues
 
 // Adam on means, quats, log-scales and opacity logits, with the projection's VJP (as
 // projection_ewa_3dgs_fused_bwd_kernel, for one camera), the gradients of the sigmoid
-// and the regularizers (per value), the record of the delayed SH update and MCMC's noise. As in the original 3DGS, the position gets no gradient
-// through the view direction of the SH colors.
+// and the regularizers (per value), the record of the delayed SH update and MCMC's noise.
+// Unlike rasterization(), the position gets no gradient through the view direction of the
+// SH colors.
 __global__ void fused_geometry_kernel(
     const int N,
     const AdamTensor means,
@@ -408,11 +498,7 @@ __global__ void fused_geometry_kernel(
         {
             quat_s.grad[c] = d_quat[c];
         }
-        const int st    = state[g];
-        pend[g * 6 + 3] = st & 8 ? vc[0] : 0.f;
-        pend[g * 6 + 4] = st & 16 ? vc[1] : 0.f;
-        pend[g * 6 + 5] = st & 32 ? vc[2] : 0.f;
-        state[g]        = st | (degree + 1);
+        sh_pend(state[g], pend + g * 6, vc, degree);
     }
     opacity_s.grad[0] = (d_opacity + opacity_reg) * (sig * (1.f - sig));
     for(int c = 0; c < 3; ++c)
@@ -703,7 +789,27 @@ void l1_ssim(
 )
 {
     DEVICE_GUARD(render);
+    CHECK_INPUT(render);
+    CHECK_INPUT(target);
+    TORCH_CHECK(
+        render.dim() == 4 && render.size(0) == 1 && render.size(3) == 3 && target.sizes() == render.sizes(),
+        "render and target must have the same shape [1, H, W, 3], got ",
+        render.sizes(),
+        " and ",
+        target.sizes()
+    );
     const int H = render.size(1), W = render.size(2);
+    CHECK_INPUT(dm);
+    CHECK_INPUT(out);
+    TORCH_CHECK(
+        dm.numel() == 9ll * H * W && out.numel() == (v_loss ? 3ll : 2ll) * H * W,
+        "dm must hold 9 values per pixel and out 2, or 3 with v_loss"
+    );
+    if(v_loss)
+    {
+        CHECK_INPUT(v_loss.value());
+        TORCH_CHECK(v_loss.value().numel() == 1, "v_loss must be a scalar");
+    }
     auto kernel = v_loss ? l1_ssim_kernel<true> : l1_ssim_kernel<false>;
     kernel<<<dim3((W + 15) / 16, (H + 15) / 16), 256, 0, GET_CURRENT_STREAM()>>>(
         H,

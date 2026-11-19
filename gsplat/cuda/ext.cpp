@@ -86,6 +86,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 #ifdef USE_ROCM
     m.def("l1_ssim", &gsplat::l1_ssim);
     m.def("fused_sh", &gsplat::fused_sh);
+    m.def("fused_sh_grad", &gsplat::fused_sh_grad);
     m.def("fused_geometry", &gsplat::fused_geometry);
 #endif
     m.def(

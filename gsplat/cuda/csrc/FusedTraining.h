@@ -37,6 +37,7 @@ at::Tensor fused_sh(
     double b2,
     double eps
 );
+void fused_sh_grad(at::Tensor v_colors, at::Tensor radii, int64_t degree, at::Tensor state, at::Tensor pend);
 void fused_geometry(
     std::vector<at::Tensor> params,
     std::vector<at::Tensor> first,
