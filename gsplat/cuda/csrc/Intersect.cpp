@@ -262,7 +262,7 @@ TileIntersectResult intersect_tile(
 #else
         cum_tiles_per_gauss = at::cumsum(tiles_per_gauss.view({-1}), 0, at::kLong);
 #endif
-        n_isects            = cum_tiles_per_gauss[-1].item<int64_t>();
+        n_isects = cum_tiles_per_gauss[-1].item<int64_t>();
         if(segmented)
         {
             // offsets in the isect_ids and flatten_ids

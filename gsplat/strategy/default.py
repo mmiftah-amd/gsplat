@@ -213,7 +213,8 @@ class DefaultStrategy(Strategy):
             state["count"].zero_()
             if self.refine_scale2d_stop_iter > 0:
                 state["radii"].zero_()
-            if getattr(params, "fused", None) is None:  # FusedTraining keeps it
+            # on ROCm, FusedTraining and DelayedSH keep the cache
+            if not torch.version.hip or getattr(params, "fused", None) is None:
                 torch.cuda.empty_cache()
 
         if step % self.reset_every == 0 and step > 0:

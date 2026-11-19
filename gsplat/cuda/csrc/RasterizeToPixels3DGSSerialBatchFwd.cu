@@ -93,7 +93,7 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t tile_y = tile_linear / grid_width;
     const int32_t tile_id = tile_y * grid_width + tile_x;
 
-    const uint32_t tid      = threadIdx.x;
+    const uint32_t tid = threadIdx.x;
 #    if USE_ROCM
     const uint32_t thread_x = WAVE_BLOCKS ? (tid / 32 % 2) * 8 + tid % 8 : tid & TILE_MASK;
     const uint32_t thread_y = WAVE_BLOCKS ? (tid / 64) * 8 + tid % 32 / 8 : tid >> TILE_SHIFT;
@@ -308,8 +308,8 @@ __global__ void __launch_bounds__(CTA_SIZE) rasterize_to_pixels_3dgs_fwd_kernel(
                     continue;
                 }
 
-                const int32_t g    = id_batch[t];
-                const float vis    = alpha * T[p];
+                const int32_t g = id_batch[t];
+                const float vis = alpha * T[p];
 #    if USE_ROCM
                 const float *c_ptr = WAVE_BLOCKS ? color_batch + t * CDIM : colors + g * CDIM;
 #    else
